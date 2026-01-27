@@ -228,12 +228,23 @@ class KernelBuilder:
         # Process ALL rounds without storing back
         for round_num in range(rounds):
             # PHASE 3-4: Get tree node values
+            # Optimize shallow levels with preloaded nodes + vselect
             if round_num == 0:
                 # All indices are 0, use preloaded node 0
                 for b in range(group_size):
                     self.bundle_add("valu", ("+", group_v_node[b], preloaded_nodes[0], v_zero))
                 self.emit_bundle()
+            elif round_num == 1:
+                # Indices are 1 or 2
+                # idx & 1: gives 1 for idx=1, 0 for idx=2
+                for b in range(group_size):
+                    self.bundle_add("valu", ("&", group_v_addr[b], group_v_idx[b], v_one))
+                self.emit_bundle()
+                for b in range(group_size):
+                    self.bundle_add("flow", ("vselect", group_v_node[b], group_v_addr[b], preloaded_nodes[1], preloaded_nodes[2]))
+                    self.emit_bundle()
             else:
+                # Standard memory load path for deeper levels
                 # Compute all tree addresses
                 for b in range(group_size):
                     self.bundle_add("valu", ("+", group_v_addr[b], v_forest_p, group_v_idx[b]))
