@@ -14,6 +14,8 @@ Validate your results using `python tests/submission_tests.py` without modifying
 anything in the tests/ folder.
 
 We recommend you look through problem.py next.
+
+# MODIFICATION: This version stores both values AND indices to memory.
 """
 
 from collections import defaultdict
@@ -423,6 +425,7 @@ class KernelBuilder:
         - Phase 1: SIMD vectorization + scratch residency
         - Phase 2: Hash optimization with multiply_add fusion
         - Phase 3: Preload nodes for depths 0-3, eliminate gathers
+        - MODIFICATION: Now stores both values AND indices at the end
         """
         n_tiles = batch_size // VLEN  # 256/8 = 32 tiles
         max_depth = forest_height  # Tree has depths 0 to forest_height
@@ -768,9 +771,8 @@ class KernelBuilder:
                     body.append(("valu", ("^", val_addr, val_addr, tmp2_addr)))
 
                 # Pointer update for this group
-                if is_last_round:
-                    pass
-                elif is_leaf_depth:
+                # NOTE: We need to compute pointer even in last round to store the final indices
+                if is_leaf_depth:
                     for tile in tiles:
                         ptr_addr = ptr_tiles_base + tile * VLEN
                         body.append(("valu", ("+", ptr_addr, fvp_vec, zero_vec)))
@@ -795,19 +797,46 @@ class KernelBuilder:
                         tmp1_addr = tmp1_tiles_base + tile * VLEN
                         body.append(("valu", ("+", ptr_addr, ptr_addr, tmp1_addr)))
 
-                # Stores for last round
+                # Stores for last round - NOW STORES BOTH VALUES AND INDICES
                 if is_last_round:
-                    store_addr_temps = node_addr_temps
-                    batch_size_store = len(store_addr_temps)
+                    # Split node_addr_temps: first half for value addresses, second half for index addresses
+                    batch_size_store = len(node_addr_temps) // 2  # 7 temps for values, 7 for indices
+                    val_addr_temps = node_addr_temps[:batch_size_store]
+                    idx_addr_temps = node_addr_temps[batch_size_store:batch_size_store*2]
+
                     for batch_start in range(0, len(tiles), batch_size_store):
                         batch_end = min(batch_start + batch_size_store, len(tiles))
-                        for i, tile in enumerate(tiles[batch_start:batch_end]):
+                        batch_tiles = tiles[batch_start:batch_end]
+
+                        # Phase 1: Compute indices (idx = ptr - fvp) into tmp2_tiles
+                        # Use tmp2_tiles since it's available after hash computation
+                        for i, tile in enumerate(batch_tiles):
+                            tile_offset = tile * VLEN
+                            ptr_addr = ptr_tiles_base + tile_offset
+                            idx_dest = tmp2_tiles_base + tile_offset
+                            body.append(("valu", ("-", idx_dest, ptr_addr, fvp_vec)))
+
+                        # Phase 2: Compute value store addresses
+                        for i, tile in enumerate(batch_tiles):
                             tile_offset = tile * VLEN
                             offset_const = self.scratch_const(tile_offset)
-                            body.append(("alu", ("+", store_addr_temps[i], self.scratch["inp_values_p"], offset_const)))
-                        for i, tile in enumerate(tiles[batch_start:batch_end]):
+                            body.append(("alu", ("+", val_addr_temps[i], self.scratch["inp_values_p"], offset_const)))
+
+                        # Phase 3: Compute index store addresses (parallel with Phase 2)
+                        for i, tile in enumerate(batch_tiles):
                             tile_offset = tile * VLEN
-                            body.append(("store", ("vstore", store_addr_temps[i], val_tiles_base + tile_offset)))
+                            offset_const = self.scratch_const(tile_offset)
+                            body.append(("alu", ("+", idx_addr_temps[i], self.scratch["inp_indices_p"], offset_const)))
+
+                        # Phase 4: Store values
+                        for i, tile in enumerate(batch_tiles):
+                            tile_offset = tile * VLEN
+                            body.append(("store", ("vstore", val_addr_temps[i], val_tiles_base + tile_offset)))
+
+                        # Phase 5: Store indices
+                        for i, tile in enumerate(batch_tiles):
+                            tile_offset = tile * VLEN
+                            body.append(("store", ("vstore", idx_addr_temps[i], tmp2_tiles_base + tile_offset)))
 
         # Remove old loop since we've replaced it with wavefront
         # The old 'for round_num in range(rounds):' loop has been replaced above
@@ -855,13 +884,17 @@ def do_kernel_test(
         assert (
             machine.mem[inp_values_p : inp_values_p + len(inp.values)]
             == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
+        ), f"Incorrect output values on round {i}"
+
+        # NOW ALSO CHECK INDICES
         inp_indices_p = ref_mem[5]
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
             print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
+        assert (
+            machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)]
+            == ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)]
+        ), f"Incorrect output indices on round {i}"
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -902,12 +935,12 @@ class Tests(unittest.TestCase):
 
 
 # To run all the tests:
-#    python perf_takehome.py
+#    python perf_takehome_indices.py
 # To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
+#    python perf_takehome_indices.py Tests.test_kernel_cycles
 # To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
 # NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
+#    python perf_takehome_indices.py Tests.test_kernel_trace
 # Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
 # You can then keep that open and re-run the test to see a new trace.
 

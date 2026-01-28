@@ -14,6 +14,9 @@ Validate your results using `python tests/submission_tests.py` without modifying
 anything in the tests/ folder.
 
 We recommend you look through problem.py next.
+
+# Note: This version has a simplified scheduler in build() - all optimizations
+# are contained within build_kernel() only.
 """
 
 from collections import defaultdict
@@ -118,49 +121,10 @@ class KernelBuilder:
             writes.add(dest)
         return writes
 
-    def _dead_code_elimination(self, slots):
-        """Remove operations whose results are never used."""
-        if not slots:
-            return slots
-
-        n = len(slots)
-        op_reads = [self.get_slot_reads(e, s) for e, s in slots]
-        op_writes = [self.get_slot_writes(e, s) for e, s in slots]
-
-        # Start with side-effect ops as live (stores, flow control)
-        live = [False] * n
-        for i, (engine, slot) in enumerate(slots):
-            if engine == "store":
-                live[i] = True
-            elif engine == "flow" and slot[0] in ("pause", "halt", "jump", "cond_jump"):
-                live[i] = True
-            elif engine == "debug":
-                live[i] = True
-
-        # Backward pass: mark ops as live if their writes are read by a live op
-        changed = True
-        while changed:
-            changed = False
-            for i in range(n - 1, -1, -1):
-                if live[i]:
-                    # Mark all ops that write to addresses we read as live
-                    for addr in op_reads[i]:
-                        for j in range(i - 1, -1, -1):
-                            if not live[j] and addr in op_writes[j]:
-                                live[j] = True
-                                changed = True
-                                break  # Found the producer, don't look further back
-
-        # Filter to only live ops
-        return [slots[i] for i in range(n) if live[i]]
-
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        """Pack slots into instruction bundles using list scheduling with proper dependency handling."""
+        """Pack slots into instruction bundles using simplified list scheduling."""
         if not slots:
             return []
-
-        # Dead code elimination disabled - breaks correctness with wavefront scheduling
-        # slots = self._dead_code_elimination(slots)
 
         n = len(slots)
         if n == 0:
@@ -211,88 +175,34 @@ class KernelBuilder:
 
         # Compute reverse dependencies for efficient updates
         strict_reverse = [set() for _ in range(n)]
-        weak_reverse = [set() for _ in range(n)]
         for i in range(n):
             for j in strict_deps[i]:
                 strict_reverse[j].add(i)
-            for j in weak_deps[i]:
-                weak_reverse[j].add(i)
-
-        # Compute criticality (longest path to any sink)
-        # Sinks are stores and flow control (pause, halt)
-        criticality = [0] * n
-        visited = [False] * n
-
-        def compute_criticality(i):
-            if visited[i]:
-                return criticality[i]
-            visited[i] = True
-            engine = slots[i][0]
-            # Sink nodes have criticality 0
-            if engine == "store" or (engine == "flow" and slots[i][1][0] in ("pause", "halt")):
-                criticality[i] = 0
-            else:
-                # Max of successors + 1
-                max_succ = -1
-                for j in strict_reverse[i]:
-                    max_succ = max(max_succ, compute_criticality(j))
-                criticality[i] = max_succ + 1 if max_succ >= 0 else 0
-            return criticality[i]
-
-        for i in range(n):
-            compute_criticality(i)
 
         # Scheduling state
         scheduled = [False] * n
         strict_remaining = [len(d) for d in strict_deps]
-        weak_remaining = [len(d) for d in weak_deps]
 
         instrs = []
 
         while True:
             # Find ready ops: strict deps satisfied
-            # Weak deps can be satisfied in same cycle
-            ready = []
-            for i in range(n):
-                if not scheduled[i] and strict_remaining[i] == 0:
-                    ready.append(i)
+            ready = [i for i in range(n) if not scheduled[i] and strict_remaining[i] == 0]
 
             if not ready:
-                # Check if we're done
-                if all(scheduled):
-                    break
-                # Shouldn't happen with correct deps
                 break
 
-            # Sort by priority:
-            # 1. Loads first (to start data flowing)
-            # 2. Stores (also scarce)
-            # 3. Higher criticality (longer path to sink)
-            # 4. Ops that unblock loads
-            # 5. VALU next (6 slots, need to fill them)
-            # 6. ALU (12 slots, easier to fill)
-            # 7. Ops with more successors (enable more parallelism)
-            # 8. Original order
+            # Simple priority: loads first, then stores, then original order
             def priority(i):
                 engine = slots[i][0]
-                is_load = 1 if engine == "load" else 0
-                is_store = 1 if engine == "store" else 0
-                is_valu = 1 if engine == "valu" else 0
-                # Check if this op unblocks any loads
-                unblocks_load = 0
-                for j in strict_reverse[i]:
-                    if slots[j][0] == "load":
-                        unblocks_load = 1
-                        break
-                # Count successors
-                n_successors = len(strict_reverse[i])
-                return (-is_load, -is_store, -criticality[i], -unblocks_load, -is_valu, -n_successors, i)
+                is_load = 0 if engine == "load" else 1
+                is_store = 0 if engine == "store" else 1
+                return (is_load, is_store, i)
             ready.sort(key=priority)
 
             # Build bundle for this cycle
             current_bundle = defaultdict(list)
             current_writes = set()
-            current_reads = set()
             scheduled_this_cycle = []
 
             for i in ready:
@@ -324,11 +234,9 @@ class KernelBuilder:
                 # Can schedule this op
                 current_bundle[engine].append(slot)
                 current_writes.update(writes)
-                current_reads.update(reads)
                 scheduled_this_cycle.append(i)
 
             if not scheduled_this_cycle:
-                # Shouldn't happen - at least one ready op should be schedulable
                 break
 
             # Commit this cycle
@@ -337,9 +245,6 @@ class KernelBuilder:
                 # Update strict deps of successors
                 for j in strict_reverse[i]:
                     strict_remaining[j] -= 1
-                # Update weak deps of successors
-                for j in weak_reverse[i]:
-                    weak_remaining[j] -= 1
 
             instrs.append(dict(current_bundle))
 
@@ -902,12 +807,12 @@ class Tests(unittest.TestCase):
 
 
 # To run all the tests:
-#    python perf_takehome.py
+#    python perf_takehome_build.py
 # To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
+#    python perf_takehome_build.py Tests.test_kernel_cycles
 # To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
 # NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
+#    python perf_takehome_build.py Tests.test_kernel_trace
 # Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
 # You can then keep that open and re-run the test to see a new trace.
 
