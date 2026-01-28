@@ -156,12 +156,18 @@ class KernelBuilder:
         # Filter to only live ops
         return [slots[i] for i in range(n) if live[i]]
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        """Pack slots into instruction bundles using list scheduling with proper dependency handling."""
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False,
+              beam_width: int = 2, beam_cycles: int = 0, beam_bundles: int = 3):
+        """Pack slots into instruction bundles using list scheduling with beam search.
+
+        For the first beam_cycles cycles, maintains beam_width candidate schedules,
+        exploring beam_bundles different bundle choices at each step.
+        """
         if not slots:
             return []
 
         # Dead code elimination disabled - breaks correctness with wavefront scheduling
+        # The issue is that DCE doesn't see implicit dependencies between wavefront rounds
         # slots = self._dead_code_elimination(slots)
 
         n = len(slots)
@@ -244,60 +250,63 @@ class KernelBuilder:
         for i in range(n):
             compute_criticality(i)
 
-        # Scheduling state
-        scheduled = [False] * n
-        strict_remaining = [len(d) for d in strict_deps]
-        weak_remaining = [len(d) for d in weak_deps]
+        # Compute dist_to_load: minimum distance to any load op
+        # This helps prioritize ops that are on the path to loads
+        dist_to_load = [float('inf')] * n
+        from collections import deque
 
-        instrs = []
+        # Start BFS from all load ops
+        queue = deque()
+        for i in range(n):
+            if slots[i][0] == "load":
+                dist_to_load[i] = 0
+                queue.append(i)
 
-        while True:
-            # Find ready ops: strict deps satisfied
-            # Weak deps can be satisfied in same cycle
-            ready = []
-            for i in range(n):
-                if not scheduled[i] and strict_remaining[i] == 0:
-                    ready.append(i)
+        # BFS backward through dependencies
+        while queue:
+            i = queue.popleft()
+            # For each op j that i depends on (j -> i in dep graph)
+            for j in strict_deps[i]:
+                new_dist = dist_to_load[i] + 1
+                if new_dist < dist_to_load[j]:
+                    dist_to_load[j] = new_dist
+                    queue.append(j)
 
-            if not ready:
-                # Check if we're done
-                if all(scheduled):
+        # Cap at reasonable max
+        for i in range(n):
+            if dist_to_load[i] == float('inf'):
+                dist_to_load[i] = 1000
+
+        def priority(i):
+            """Priority function for sorting ready ops."""
+            engine = slots[i][0]
+            is_load = 1 if engine == "load" else 0
+            is_store = 1 if engine == "store" else 0
+            is_valu = 1 if engine == "valu" else 0
+            # Check if this op unblocks any loads
+            unblocks_load = 0
+            for j in strict_reverse[i]:
+                if slots[j][0] == "load":
+                    unblocks_load = 1
                     break
-                # Shouldn't happen with correct deps
-                break
+            # Count successors
+            n_successors = len(strict_reverse[i])
+            return (-is_load, -is_store, dist_to_load[i], -unblocks_load, -criticality[i], -is_valu, -n_successors, i)
 
-            # Sort by priority:
-            # 1. Loads first (to start data flowing)
-            # 2. Stores (also scarce)
-            # 3. Higher criticality (longer path to sink)
-            # 4. Ops that unblock loads
-            # 5. VALU next (6 slots, need to fill them)
-            # 6. ALU (12 slots, easier to fill)
-            # 7. Ops with more successors (enable more parallelism)
-            # 8. Original order
-            def priority(i):
-                engine = slots[i][0]
-                is_load = 1 if engine == "load" else 0
-                is_store = 1 if engine == "store" else 0
-                is_valu = 1 if engine == "valu" else 0
-                # Check if this op unblocks any loads
-                unblocks_load = 0
-                for j in strict_reverse[i]:
-                    if slots[j][0] == "load":
-                        unblocks_load = 1
-                        break
-                # Count successors
-                n_successors = len(strict_reverse[i])
-                return (-is_load, -is_store, -criticality[i], -unblocks_load, -is_valu, -n_successors, i)
-            ready.sort(key=priority)
+        def build_bundle(ready, scheduled, scheduled_this_cycle_set, skip_indices=None):
+            """Build a bundle from ready ops, optionally skipping some indices."""
+            if skip_indices is None:
+                skip_indices = set()
 
-            # Build bundle for this cycle
             current_bundle = defaultdict(list)
             current_writes = set()
             current_reads = set()
             scheduled_this_cycle = []
 
             for i in ready:
+                if i in skip_indices:
+                    continue
+
                 engine, slot = slots[i]
                 reads = op_reads[i]
                 writes = op_writes[i]
@@ -317,7 +326,7 @@ class KernelBuilder:
                 # Check weak deps: all weak deps must be scheduled (can be this cycle)
                 weak_ok = True
                 for j in weak_deps[i]:
-                    if not scheduled[j] and j not in scheduled_this_cycle:
+                    if not scheduled[j] and j not in scheduled_this_cycle_set and j not in scheduled_this_cycle:
                         weak_ok = False
                         break
                 if not weak_ok:
@@ -329,23 +338,122 @@ class KernelBuilder:
                 current_reads.update(reads)
                 scheduled_this_cycle.append(i)
 
-            if not scheduled_this_cycle:
-                # Shouldn't happen - at least one ready op should be schedulable
+            return current_bundle, scheduled_this_cycle
+
+        def score_state(scheduled, strict_remaining, instrs_so_far):
+            """Score a partial schedule. Higher is better."""
+            # Count loads scheduled (important to start data flowing)
+            loads_scheduled = sum(1 for i in range(n) if scheduled[i] and slots[i][0] == "load")
+            # Count total ops scheduled
+            ops_scheduled = sum(scheduled)
+            # Count flow ops (scarce resource)
+            flow_scheduled = sum(1 for i in range(n) if scheduled[i] and slots[i][0] == "flow")
+            # Sum of dist_to_load for scheduled ops (lower is better)
+            dtl_sum = sum(dist_to_load[i] for i in range(n) if scheduled[i])
+
+            # Score: prioritize loads, then total ops, penalize flow usage and dist_to_load
+            return loads_scheduled * 100 + ops_scheduled * 10 - flow_scheduled * 5 - dtl_sum * 0.1
+
+        # Beam search state: (scheduled, strict_remaining, weak_remaining, instrs)
+        initial_state = (
+            [False] * n,
+            [len(d) for d in strict_deps],
+            [len(d) for d in weak_deps],
+            []
+        )
+
+        beam = [initial_state]
+
+        cycle = 0
+        while beam:
+            # Check if best state is done
+            best_scheduled = beam[0][0]
+            if all(best_scheduled):
                 break
 
-            # Commit this cycle
-            for i in scheduled_this_cycle:
-                scheduled[i] = True
-                # Update strict deps of successors
-                for j in strict_reverse[i]:
-                    strict_remaining[j] -= 1
-                # Update weak deps of successors
-                for j in weak_reverse[i]:
-                    weak_remaining[j] -= 1
+            new_beam = []
 
-            instrs.append(dict(current_bundle))
+            for state in beam:
+                scheduled, strict_remaining, weak_remaining, instrs = state
 
-        return instrs
+                # Find ready ops for this state
+                ready = [i for i in range(n) if not scheduled[i] and strict_remaining[i] == 0]
+
+                if not ready:
+                    if all(scheduled):
+                        new_beam.append(state)
+                    continue
+
+                # Sort by priority
+                ready.sort(key=priority)
+
+                if cycle < beam_cycles:
+                    # Beam search: explore multiple bundle choices
+                    # Generate beam_bundles different bundles by skipping different ops
+                    bundles_to_try = []
+
+                    # Bundle 0: standard greedy
+                    bundle, sched = build_bundle(ready, scheduled, set())
+                    if sched:
+                        bundles_to_try.append((bundle, sched))
+
+                    # Bundle 1+: skip some high-priority ops to explore alternatives
+                    for skip_count in range(1, min(beam_bundles, len(ready))):
+                        # Skip the first skip_count ops
+                        skip_set = set(ready[:skip_count])
+                        bundle, sched = build_bundle(ready, scheduled, set(), skip_set)
+                        if sched and (bundle, sched) not in bundles_to_try:
+                            bundles_to_try.append((bundle, sched))
+
+                    # Create new states for each bundle choice
+                    for bundle, sched in bundles_to_try:
+                        new_scheduled = scheduled.copy()
+                        new_strict = strict_remaining.copy()
+                        new_weak = weak_remaining.copy()
+                        new_instrs = instrs + [dict(bundle)]
+
+                        for i in sched:
+                            new_scheduled[i] = True
+                            for j in strict_reverse[i]:
+                                new_strict[j] -= 1
+                            for j in weak_reverse[i]:
+                                new_weak[j] -= 1
+
+                        new_beam.append((new_scheduled, new_strict, new_weak, new_instrs))
+                else:
+                    # After beam_cycles, use greedy
+                    bundle, sched = build_bundle(ready, scheduled, set())
+                    if sched:
+                        new_scheduled = scheduled.copy()
+                        new_strict = strict_remaining.copy()
+                        new_weak = weak_remaining.copy()
+                        new_instrs = instrs + [dict(bundle)]
+
+                        for i in sched:
+                            new_scheduled[i] = True
+                            for j in strict_reverse[i]:
+                                new_strict[j] -= 1
+                            for j in weak_reverse[i]:
+                                new_weak[j] -= 1
+
+                        new_beam.append((new_scheduled, new_strict, new_weak, new_instrs))
+
+            if not new_beam:
+                break
+
+            # Score and keep top beam_width states
+            if cycle < beam_cycles:
+                new_beam.sort(key=lambda s: -score_state(s[0], s[1], s[3]))
+                beam = new_beam[:beam_width]
+            else:
+                beam = new_beam
+
+            cycle += 1
+
+        # Return instructions from best state
+        if beam:
+            return beam[0][3]
+        return []
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -532,9 +640,11 @@ class KernelBuilder:
 
         # Pointer-form offset vectors
         # For depth 0: ptr = (fvp + 1) + bit
-        # For depth > 0: ptr = 2*ptr + (1 - fvp) + bit
-        ptr_offset_scalar = self.alloc_scratch("ptr_offset_scalar")  # 1 - forest_values_p
-        ptr_offset_vec = self.alloc_scratch("ptr_offset_vec", VLEN)
+        # For depth > 0 with vselect: ptr = 2*ptr + addend, where addend = (1-fvp) if bit=0, (2-fvp) if bit=1
+        ptr_offset0_scalar = self.alloc_scratch("ptr_offset0_scalar")  # 1 - forest_values_p (addend when bit=0)
+        ptr_offset0_vec = self.alloc_scratch("ptr_offset0_vec", VLEN)
+        ptr_offset1_scalar = self.alloc_scratch("ptr_offset1_scalar")  # 2 - forest_values_p (addend when bit=1)
+        ptr_offset1_vec = self.alloc_scratch("ptr_offset1_vec", VLEN)
         fvp_plus_1_scalar = self.alloc_scratch("fvp_plus_1_scalar")  # forest_values_p + 1
         fvp_plus_1_vec = self.alloc_scratch("fvp_plus_1_vec", VLEN)
         fvp_plus_3_scalar = self.alloc_scratch("fvp_plus_3_scalar")  # forest_values_p + 3 (for depth 2)
@@ -555,8 +665,10 @@ class KernelBuilder:
         init_ops.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
 
         # Pointer-form offset computations (depend on forest_values_p being loaded)
-        # ptr_offset = 1 - forest_values_p (for depth > 0 update)
-        init_ops.append(("alu", ("-", ptr_offset_scalar, one_const, self.scratch["forest_values_p"])))
+        # ptr_offset0 = 1 - forest_values_p (addend when bit=0)
+        init_ops.append(("alu", ("-", ptr_offset0_scalar, one_const, self.scratch["forest_values_p"])))
+        # ptr_offset1 = 2 - forest_values_p (addend when bit=1)
+        init_ops.append(("alu", ("-", ptr_offset1_scalar, two_const, self.scratch["forest_values_p"])))
         # fvp_plus_1 = forest_values_p + 1 (for depth 0 update and depth 1)
         init_ops.append(("alu", ("+", fvp_plus_1_scalar, self.scratch["forest_values_p"], one_const)))
         # fvp_plus_3 = forest_values_p + 3 (for depth 2)
@@ -564,7 +676,8 @@ class KernelBuilder:
         # fvp_plus_7 = forest_values_p + 7 (for depth 3)
         init_ops.append(("alu", ("+", fvp_plus_7_scalar, self.scratch["forest_values_p"], seven_const)))
         # Broadcast these offsets
-        init_ops.append(("valu", ("vbroadcast", ptr_offset_vec, ptr_offset_scalar)))
+        init_ops.append(("valu", ("vbroadcast", ptr_offset0_vec, ptr_offset0_scalar)))
+        init_ops.append(("valu", ("vbroadcast", ptr_offset1_vec, ptr_offset1_scalar)))
         init_ops.append(("valu", ("vbroadcast", fvp_plus_1_vec, fvp_plus_1_scalar)))
         init_ops.append(("valu", ("vbroadcast", fvp_plus_3_vec, fvp_plus_3_scalar)))
         init_ops.append(("valu", ("vbroadcast", fvp_plus_7_vec, fvp_plus_7_scalar)))
@@ -621,7 +734,7 @@ class KernelBuilder:
 
         # Wavefront scheduling: divide tiles into groups that are staggered by round
         # This creates overlapping phases for better resource utilization
-        wavefront_groups = 7  # Optimal: 1440 cycles
+        wavefront_groups = 8  # Optimal for this code structure (tested 5-20)
         tiles_per_group = (n_tiles + wavefront_groups - 1) // wavefront_groups
 
         def get_group_tiles(group_idx):
@@ -651,6 +764,8 @@ class KernelBuilder:
                         val_addr = val_tiles_base + tile * VLEN
                         body.append(("valu", ("^", val_addr, val_addr, preloaded_node_vecs[0])))
                 elif depth >= 4:
+                    # Emit all loads first, then all XORs (scheduler handles interleaving)
+                    # Hash is done in the shared section below
                     for tile in tiles:
                         ptr_addr = ptr_tiles_base + tile * VLEN
                         for lane in range(VLEN):
@@ -785,17 +900,22 @@ class KernelBuilder:
                         ptr_addr = ptr_tiles_base + tile * VLEN
                         body.append(("valu", ("+", ptr_addr, ptr_addr, fvp_plus_1_vec)))
                 else:
+                    # Pointer update with vselect: trades 1 VALU for 1 FLOW
+                    # Old: bit = val & 1 (VALU), ptr = 2*ptr + offset0 (VALU), ptr += bit (VALU) = 3 VALU
+                    # New: bit = val & 1 (VALU), addend = vselect(bit, offset1, offset0) (FLOW),
+                    #      ptr = 2*ptr + addend (VALU) = 2 VALU + 1 FLOW
                     for tile in tiles:
                         val_addr = val_tiles_base + tile * VLEN
                         tmp1_addr = tmp1_tiles_base + tile * VLEN
-                        body.append(("valu", ("&", tmp1_addr, val_addr, one_vec)))
+                        body.append(("valu", ("&", tmp1_addr, val_addr, one_vec)))  # bit = val & 1
                     for tile in tiles:
-                        ptr_addr = ptr_tiles_base + tile * VLEN
-                        body.append(("valu", ("multiply_add", ptr_addr, ptr_addr, two_vec, ptr_offset_vec)))
+                        tmp1_addr = tmp1_tiles_base + tile * VLEN
+                        # vselect: if bit then offset1 else offset0 (read bit first, then write addend)
+                        body.append(("flow", ("vselect", tmp1_addr, tmp1_addr, ptr_offset1_vec, ptr_offset0_vec)))
                     for tile in tiles:
                         ptr_addr = ptr_tiles_base + tile * VLEN
                         tmp1_addr = tmp1_tiles_base + tile * VLEN
-                        body.append(("valu", ("+", ptr_addr, ptr_addr, tmp1_addr)))
+                        body.append(("valu", ("multiply_add", ptr_addr, ptr_addr, two_vec, tmp1_addr)))
 
                 # Stores for last round - NOW STORES BOTH VALUES AND INDICES
                 if is_last_round:
